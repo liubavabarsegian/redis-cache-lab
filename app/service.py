@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import time
@@ -28,18 +29,24 @@ class ProductService:
         self.mode = mode
         self.clock = clock
         self._dirty: set[int] = set()
+        self._locks: dict[int, asyncio.Lock] = {}
 
     async def get(self, product_id: int) -> Product:
         entry = await self._read(product_id)
         if entry is not None and self.clock() < entry.fresh_until:
             return entry.product
-        return await self._load(product_id)
+        async with self._lock(product_id):
+            entry = await self._read(product_id)
+            if entry is not None and self.clock() < entry.fresh_until:
+                return entry.product
+            return await self._load(product_id)
 
     async def update(self, product_id: int, patch: ProductPatch) -> Product:
-        product = await self.source.update(product_id, patch)
-        self._dirty.add(product_id)
-        await self._invalidate(product_id)
-        return product
+        async with self._lock(product_id):
+            product = await self.source.update(product_id, patch)
+            self._dirty.add(product_id)
+            await self._invalidate(product_id)
+            return product
 
     async def wait_idle(self) -> None:
         pass
@@ -49,6 +56,11 @@ class ProductService:
 
     def _key(self, product_id: int) -> str:
         return f"{self.prefix}:product:{product_id}"
+
+    def _lock(self, product_id: int) -> asyncio.Lock:
+        if product_id not in self._locks:
+            self._locks[product_id] = asyncio.Lock()
+        return self._locks[product_id]
 
     async def _read(self, product_id: int) -> "_CacheEntry | None":
         if product_id in self._dirty:
